@@ -39,18 +39,14 @@ jobs:
 
       - name: Install Floci CLI & Tunnel Tools
         run: |
+          echo "Installing bore and cloudflared..."
+          curl -Ls https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | sudo tar xz -C /usr/local/bin
+          curl -sL --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
           curl -fsSL https://floci.io/install.sh | sh
           echo "$HOME/.floci/bin" >> $GITHUB_PATH
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          sudo apt-get update -y
-          sudo apt-get install -y tmux tmate jq netcat-openbsd dnsutils
-
-          # Install bore (TCP SSH tunnel)
-          curl -Ls https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | sudo tar xz -C /usr/local/bin
-
-          # Install cloudflared (Instant HTTPS Web UI tunnel)
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
 
       - name: Start Selected Floci Cloud Services & Unified Web UI (:4500)
         env:
@@ -126,8 +122,11 @@ jobs:
           SECRET_SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set +e
+          echo "[1/4] Configuring SSH Server on Ubuntu 24.04..."
           sudo mkdir -p /var/run/sshd
           mkdir -p $HOME/.ssh && chmod 700 $HOME/.ssh
+          [ -f $HOME/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -f $HOME/.ssh/id_ed25519 -N "" -q
+
           if [ -n "$USER_SSH_KEY" ]; then
             echo "$USER_SSH_KEY" >> $HOME/.ssh/authorized_keys
           fi
@@ -138,34 +137,30 @@ jobs:
           TEMP_PASS=$(openssl rand -hex 8)
           echo "runner:$TEMP_PASS" | sudo chpasswd
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-          sudo service ssh restart
+          sudo sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh || true
+          sudo systemctl restart ssh || sudo /usr/sbin/sshd
 
-          # 1. Start Bore tunnels (SSH :22 and Web UI :4500)
-          nohup bore local 22 --to bore.pub > /tmp/bore-ssh.log 2>&1 </dev/null &
-          nohup bore local 4500 --to bore.pub > /tmp/bore-ui.log 2>&1 </dev/null &
+          echo "[2/4] Starting detached background tunnels via systemd-run..."
+          sudo systemd-run --unit=bore-ssh /bin/bash -c "bore local 22 --to bore.pub > /tmp/bore-ssh.log 2>&1"
+          sudo systemd-run --unit=bore-ui /bin/bash -c "bore local 4500 --to bore.pub > /tmp/bore-ui.log 2>&1"
+          sudo systemd-run --unit=cf-ui /bin/bash -c "cloudflared tunnel --no-autoupdate --url http://localhost:4500 > /tmp/cf-ui.log 2>&1"
 
-          # 2. Start Cloudflare HTTPS tunnel for Web UI (:4500)
-          nohup cloudflared tunnel --no-autoupdate --url http://localhost:4500 > /tmp/cf-ui.log 2>&1 </dev/null &
-
-          # 3. Start tmate SSH fallback
-          tmate -S /tmp/tmate.sock new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
-
-          # Wait up to 12 seconds for URLs to populate
-          for i in {1..12}; do
-            CF_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /tmp/cf-ui.log | head -n 1)
-            BORE_SSH_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ssh.log | head -n 1 | cut -d: -f2)
-            [ -n "$CF_URL" ] && [ -n "$BORE_SSH_PORT" ] && break
+          echo "[3/4] Waiting for public URLs to initialize..."
+          for i in {1..15}; do
+            CF_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /tmp/cf-ui.log 2>/dev/null | head -n 1)
+            BORE_SSH_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ssh.log 2>/dev/null | head -n 1 | cut -d: -f2)
+            if [ -n "$CF_URL" ] && [ -n "$BORE_SSH_PORT" ]; then
+              break
+            fi
             sleep 1
           done
 
-          BORE_UI_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ui.log | head -n 1 | cut -d: -f2)
-          BORE_IP=$(dig +short bore.pub | head -n 1)
-          RUNNER_IP=$(curl -s https://ifconfig.me)
-          TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          TMATE_WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          BORE_UI_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ui.log 2>/dev/null | head -n 1 | cut -d: -f2)
+          BORE_IP=$(getent hosts bore.pub | awk '{ print $1 ; exit }')
+          RUNNER_IP=$(curl -s --max-time 5 https://ifconfig.me)
 
-          echo ""
+          echo "[4/4] Printing connection details..."
           echo "=================================================================="
           echo "🚀 FLOCI MULTI-CLOUD LAB + WEB UI READY (${{ inputs.cloud_env }})"
           echo "=================================================================="
@@ -181,31 +176,26 @@ jobs:
           echo ""
           echo "💻 3. SSH WITH LOCALHOST PORT FORWARDING (Run on your PC):"
           echo "   ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub"
-          echo ""
-          echo "🛠️ 4. TMATE INSTANT SSH & WEB TERMINAL:"
-          echo "   SSH : $TMATE_SSH"
-          echo "   Web : $TMATE_WEB"
           echo "=================================================================="
 
-          # Write a clickable Markdown summary to the GitHub Actions Summary page
-          cat << EOF >> $GITHUB_STEP_SUMMARY
-          ## 🚀 Floci Multi-Cloud Lab Ready (\`${{ inputs.cloud_env }}\`)
-          | Access Method | Link / Command |
-          | :--- | :--- |
-          | **🌐 Direct Web Console (HTTPS)** | [**$CF_URL**]($CF_URL) |
-          | **🌐 Backup Web Console (HTTP)** | \`http://bore.pub:$BORE_UI_PORT\` |
-          | **💻 Web Terminal (Browser SSH)** | [**$TMATE_WEB**]($TMATE_WEB) |
-          | **🔑 SSH Password** | \`$TEMP_PASS\` (User: \`runner\`) |
-          | **⚡ Instant Tmate SSH** | \`$TMATE_SSH\` |
-          | **🔌 Localhost Port-Forward SSH** | \`ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub\` |
-          EOF
+          # Write clickable Markdown summary without heredoc indentation issues
+          {
+            echo "## 🚀 Floci Multi-Cloud Lab Ready (\`${{ inputs.cloud_env }}\`)"
+            echo "| Access Method | Link / Command |"
+            echo "| :--- | :--- |"
+            echo "| **🌐 Direct Web Console (HTTPS)** | [**$CF_URL**]($CF_URL) |"
+            echo "| **🌐 Backup Web Console (HTTP)** | \`http://bore.pub:$BORE_UI_PORT\` |"
+            echo "| **🔑 SSH Password** | \`$TEMP_PASS\` (User: \`runner\`, Tunnel IP: \`$BORE_IP\`) |"
+            echo "| **🔌 Direct SSH Command** | \`ssh -p $BORE_SSH_PORT runner@bore.pub\` |"
+            echo "| **💻 Localhost Port-Forward SSH** | \`ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep Session Alive for 5 Hours
         env:
           SESSION_HOURS: ${{ inputs.session_hours }}
         run: |
-          echo "Session is now live! Click 'Summary' in the top-left sidebar or scroll up to 'Start SSH & Web Console Tunnels' for your clickable URLs."
-          echo "To stop early, run inside SSH: touch /tmp/stop-session"
+          echo "✅ Tunnels are active! Click 'Summary' in the top-left sidebar or check the previous step for your clickable Web UI link and SSH command."
+          echo "To end this session early, run inside SSH: touch /tmp/stop-session"
           MAX_SECONDS=$(( SESSION_HOURS * 3600 ))
           ELAPSED=0
           while [ $ELAPSED -lt $MAX_SECONDS ]; do
