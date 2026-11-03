@@ -1,0 +1,196 @@
+name: Floci Multi-Cloud Interactive Lab (5-Hour SSH + Web UI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud_env:
+        description: 'Select Cloud Environment to Provision'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - aws
+          - az
+          - gcp
+          - oci
+      ssh_public_key:
+        description: 'Your SSH Public Key (ssh-ed25519 / ssh-rsa) for direct login'
+        required: false
+        type: string
+      session_hours:
+        description: 'Interactive session duration in hours (Max 5)'
+        required: true
+        default: '5'
+        type: choice
+        options:
+          - '1'
+          - '3'
+          - '5'
+
+jobs:
+  floci-interactive-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Floci CLI & Networking Tools
+        run: |
+          curl -fsSL https://floci.io/install.sh | sh
+          echo "$HOME/.floci/bin" >> $GITHUB_PATH
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          sudo apt-get update -y
+          sudo apt-get install -y tmux tmate jq netcat-openbsd dnsutils
+
+      - name: Start Selected Floci Cloud Services & Unified Web UI (:4500)
+        env:
+          SELECTED_ENV: ${{ inputs.cloud_env }}
+        run: |
+          export PATH="$HOME/.floci/bin:$HOME/.local/bin:$PATH"
+          mkdir -p $HOME/floci-data/{aws,az,gcp,oci}
+
+          start_aws() {
+            echo "Starting Floci AWS Emulator on :4566..."
+            docker run -d --name floci-aws --restart unless-stopped \
+              -p 4566:4566 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $HOME/floci-data/aws:/app/data \
+              floci/floci:latest-compat
+          }
+
+          start_az() {
+            echo "Starting Floci Azure Emulator on :4577..."
+            docker run -d --name floci-az --restart unless-stopped \
+              -p 4577:4577 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $HOME/floci-data/az:/app/data \
+              -e FLOCI_AZ_TLS_ENABLED="true" \
+              -e FLOCI_AZ_HOSTNAME="localhost" \
+              floci/floci-az:latest-compat
+          }
+
+          start_gcp() {
+            echo "Starting Floci GCP & GKE Emulator on :4588..."
+            docker run -d --name floci-gcp --restart unless-stopped \
+              -p 4588:4588 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $HOME/floci-data/gcp:/app/data \
+              floci/floci-gcp:latest
+          }
+
+          start_oci() {
+            echo "Starting Floci OCI Emulator on :4599..."
+            docker run -d --name floci-oci --restart unless-stopped \
+              -p 4599:4599 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $HOME/floci-data/oci:/app/data \
+              floci/floci-oci:latest-compat
+          }
+
+          case "$SELECTED_ENV" in
+            aws) start_aws ;;
+            az)  start_az ;;
+            gcp) start_gcp ;;
+            oci) start_oci ;;
+            all)
+              start_aws
+              start_az
+              start_gcp
+              start_oci
+              ;;
+          esac
+
+          echo "Starting Floci Unified Web Console (floci-ui) on :4500..."
+          docker run -d --name floci-ui --restart unless-stopped \
+            --network host \
+            -e PORT=4500 \
+            -e FLOCI_ENDPOINT=http://localhost:4566 \
+            -e FLOCI_AZURE_ENDPOINT=http://localhost:4577 \
+            -e FLOCI_AZURE_ACCOUNT_NAME=devstoreaccount1 \
+            -e FLOCI_GCP_ENDPOINT=http://localhost:4588 \
+            -e FLOCI_GCP_PROJECT=floci-local \
+            -e FLOCI_OCI_ENDPOINT=http://localhost:4599 \
+            -e AWS_REGION=us-east-1 \
+            -e AWS_ACCESS_KEY_ID=test \
+            -e AWS_SECRET_ACCESS_KEY=test \
+            floci/floci-ui:latest
+
+      - name: Configure Pre-Authenticated Shell Profile for SSH
+        run: |
+          cat << 'EOF' >> $HOME/.bashrc
+          export PATH="$HOME/.floci/bin:$HOME/.local/bin:$PATH"
+          export AWS_ENDPOINT_URL="http://localhost:4566"
+          export AWS_DEFAULT_REGION="us-east-1"
+          export AWS_ACCESS_KEY_ID="test"
+          export AWS_SECRET_ACCESS_KEY="test"
+          export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:4577/devstoreaccount1;QueueEndpoint=http://localhost:4577/devstoreaccount1;TableEndpoint=http://localhost:4577/devstoreaccount1;"
+          export STORAGE_EMULATOR_HOST="http://localhost:4588"
+          export PUBSUB_EMULATOR_HOST="localhost:4588"
+          export FIRESTORE_EMULATOR_HOST="localhost:4588"
+          export DATASTORE_EMULATOR_HOST="localhost:4588"
+          export SECRET_MANAGER_EMULATOR_HOST="localhost:4588"
+          export CLOUDSDK_API_ENDPOINT_OVERRIDES_STORAGE="http://localhost:4588/"
+          export FLOCI_GCP_DEFAULT_PROJECT_ID="floci-local"
+          export TENANCY_OCID="ocid1.tenancy.oc1..flocilocaltenancy0000000000000000000000000000000000000000"
+          export OCI_CLI_ENDPOINT="http://localhost:4599"
+          EOF
+
+      - name: Setup SSH Server, Web UI Tunnel & 5-Hour Session
+        env:
+          USER_SSH_KEY: ${{ inputs.ssh_public_key }}
+          SECRET_SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SESSION_HOURS: ${{ inputs.session_hours }}
+        run: |
+          sudo mkdir -p /var/run/sshd
+          mkdir -p $HOME/.ssh && chmod 700 $HOME/.ssh
+          [ -n "$USER_SSH_KEY" ] && echo "$USER_SSH_KEY" >> $HOME/.ssh/authorized_keys
+          [ -n "$SECRET_SSH_KEY" ] && echo "$SECRET_SSH_KEY" >> $HOME/.ssh/authorized_keys
+
+          TEMP_PASS=$(openssl rand -hex 8)
+          echo "runner:$TEMP_PASS" | sudo chpasswd
+          sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo service ssh restart
+
+          # Install bore and expose BOTH SSH (22) and Web Console (4500)
+          curl -Ls https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | sudo tar xz -C /usr/local/bin
+          nohup bore local 22 --to bore.pub > /tmp/bore-ssh.log 2>&1 &
+          nohup bore local 4500 --to bore.pub > /tmp/bore-ui.log 2>&1 &
+
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+
+          sleep 4
+          BORE_SSH_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ssh.log | head -n 1 | cut -d: -f2)
+          BORE_UI_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ui.log | head -n 1 | cut -d: -f2)
+          BORE_IP=$(dig +short bore.pub | head -n 1)
+          TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+
+          echo "=================================================================="
+          echo "🚀 FLOCI MULTI-CLOUD LAB + WEB UI READY (${{ inputs.cloud_env }})"
+          echo "=================================================================="
+          echo "Public Tunnel IP          : $BORE_IP (bore.pub)"
+          echo "SSH Username              : runner"
+          echo "Fallback SSH Password     : $TEMP_PASS"
+          echo "------------------------------------------------------------------"
+          echo "🌐 1️⃣ ACCESS WEB CONSOLE ON YOUR LOCALHOST (:4500) VIA SSH:"
+          echo "   Run this on your laptop:"
+          echo "   ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub"
+          echo "   Then open: http://localhost:4500"
+          echo ""
+          echo "🌐 2️⃣ DIRECT PUBLIC WEB CONSOLE URL (No SSH needed):"
+          echo "   http://bore.pub:$BORE_UI_PORT  (or http://$BORE_IP:$BORE_UI_PORT)"
+          echo ""
+          echo "💻 3️⃣ TMATE SSH FALLBACK:"
+          echo "   $TMATE_SSH"
+          echo "=================================================================="
+
+          MAX_SECONDS=$(( SESSION_HOURS * 3600 ))
+          ELAPSED=0
+          while [ $ELAPSED -lt $MAX_SECONDS ]; do
+            [ -f /tmp/stop-session ] && break
+            sleep 30
+            ELAPSED=$(( ELAPSED + 30 ))
+          done
