@@ -15,7 +15,7 @@ on:
           - gcp
           - oci
       ssh_public_key:
-        description: 'Your SSH Public Key (ssh-ed25519 / ssh-rsa) for direct login'
+        description: 'Your SSH Public Key (Optional)'
         required: false
         type: string
       session_hours:
@@ -37,13 +37,20 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Floci CLI & Networking Tools
+      - name: Install Floci CLI & Tunnel Tools
         run: |
           curl -fsSL https://floci.io/install.sh | sh
           echo "$HOME/.floci/bin" >> $GITHUB_PATH
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           sudo apt-get update -y
           sudo apt-get install -y tmux tmate jq netcat-openbsd dnsutils
+
+          # Install bore (TCP SSH tunnel)
+          curl -Ls https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | sudo tar xz -C /usr/local/bin
+
+          # Install cloudflared (Instant HTTPS Web UI tunnel)
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
 
       - name: Start Selected Floci Cloud Services & Unified Web UI (:4500)
         env:
@@ -53,7 +60,6 @@ jobs:
           mkdir -p $HOME/floci-data/{aws,az,gcp,oci}
 
           start_aws() {
-            echo "Starting Floci AWS Emulator on :4566..."
             docker run -d --name floci-aws --restart unless-stopped \
               -p 4566:4566 \
               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -62,7 +68,6 @@ jobs:
           }
 
           start_az() {
-            echo "Starting Floci Azure Emulator on :4577..."
             docker run -d --name floci-az --restart unless-stopped \
               -p 4577:4577 \
               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -73,7 +78,6 @@ jobs:
           }
 
           start_gcp() {
-            echo "Starting Floci GCP & GKE Emulator on :4588..."
             docker run -d --name floci-gcp --restart unless-stopped \
               -p 4588:4588 \
               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -82,7 +86,6 @@ jobs:
           }
 
           start_oci() {
-            echo "Starting Floci OCI Emulator on :4599..."
             docker run -d --name floci-oci --restart unless-stopped \
               -p 4599:4599 \
               -v /var/run/docker.sock:/var/run/docker.sock \
@@ -103,7 +106,6 @@ jobs:
               ;;
           esac
 
-          echo "Starting Floci Unified Web Console (floci-ui) on :4500..."
           docker run -d --name floci-ui --restart unless-stopped \
             --network host \
             -e PORT=4500 \
@@ -118,79 +120,99 @@ jobs:
             -e AWS_SECRET_ACCESS_KEY=test \
             floci/floci-ui:latest
 
-      - name: Configure Pre-Authenticated Shell Profile for SSH
-        run: |
-          cat << 'EOF' >> $HOME/.bashrc
-          export PATH="$HOME/.floci/bin:$HOME/.local/bin:$PATH"
-          export AWS_ENDPOINT_URL="http://localhost:4566"
-          export AWS_DEFAULT_REGION="us-east-1"
-          export AWS_ACCESS_KEY_ID="test"
-          export AWS_SECRET_ACCESS_KEY="test"
-          export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://localhost:4577/devstoreaccount1;QueueEndpoint=http://localhost:4577/devstoreaccount1;TableEndpoint=http://localhost:4577/devstoreaccount1;"
-          export STORAGE_EMULATOR_HOST="http://localhost:4588"
-          export PUBSUB_EMULATOR_HOST="localhost:4588"
-          export FIRESTORE_EMULATOR_HOST="localhost:4588"
-          export DATASTORE_EMULATOR_HOST="localhost:4588"
-          export SECRET_MANAGER_EMULATOR_HOST="localhost:4588"
-          export CLOUDSDK_API_ENDPOINT_OVERRIDES_STORAGE="http://localhost:4588/"
-          export FLOCI_GCP_DEFAULT_PROJECT_ID="floci-local"
-          export TENANCY_OCID="ocid1.tenancy.oc1..flocilocaltenancy0000000000000000000000000000000000000000"
-          export OCI_CLI_ENDPOINT="http://localhost:4599"
-          EOF
-
-      - name: Setup SSH Server, Web UI Tunnel & 5-Hour Session
+      - name: Start SSH & Web Console Tunnels (Prints URLs Immediately)
         env:
           USER_SSH_KEY: ${{ inputs.ssh_public_key }}
           SECRET_SSH_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          SESSION_HOURS: ${{ inputs.session_hours }}
         run: |
+          set +e
           sudo mkdir -p /var/run/sshd
           mkdir -p $HOME/.ssh && chmod 700 $HOME/.ssh
-          [ -n "$USER_SSH_KEY" ] && echo "$USER_SSH_KEY" >> $HOME/.ssh/authorized_keys
-          [ -n "$SECRET_SSH_KEY" ] && echo "$SECRET_SSH_KEY" >> $HOME/.ssh/authorized_keys
+          if [ -n "$USER_SSH_KEY" ]; then
+            echo "$USER_SSH_KEY" >> $HOME/.ssh/authorized_keys
+          fi
+          if [ -n "$SECRET_SSH_KEY" ]; then
+            echo "$SECRET_SSH_KEY" >> $HOME/.ssh/authorized_keys
+          fi
 
           TEMP_PASS=$(openssl rand -hex 8)
           echo "runner:$TEMP_PASS" | sudo chpasswd
           sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
           sudo service ssh restart
 
-          # Install bore and expose BOTH SSH (22) and Web Console (4500)
-          curl -Ls https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz | sudo tar xz -C /usr/local/bin
-          nohup bore local 22 --to bore.pub > /tmp/bore-ssh.log 2>&1 &
-          nohup bore local 4500 --to bore.pub > /tmp/bore-ui.log 2>&1 &
+          # 1. Start Bore tunnels (SSH :22 and Web UI :4500)
+          nohup bore local 22 --to bore.pub > /tmp/bore-ssh.log 2>&1 </dev/null &
+          nohup bore local 4500 --to bore.pub > /tmp/bore-ui.log 2>&1 </dev/null &
 
+          # 2. Start Cloudflare HTTPS tunnel for Web UI (:4500)
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:4500 > /tmp/cf-ui.log 2>&1 </dev/null &
+
+          # 3. Start tmate SSH fallback
           tmate -S /tmp/tmate.sock new-session -d
           tmate -S /tmp/tmate.sock wait tmate-ready
 
-          sleep 4
-          BORE_SSH_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ssh.log | head -n 1 | cut -d: -f2)
+          # Wait up to 12 seconds for URLs to populate
+          for i in {1..12}; do
+            CF_URL=$(grep -oE 'https://[-a-zA-Z0-9]+\.trycloudflare\.com' /tmp/cf-ui.log | head -n 1)
+            BORE_SSH_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ssh.log | head -n 1 | cut -d: -f2)
+            [ -n "$CF_URL" ] && [ -n "$BORE_SSH_PORT" ] && break
+            sleep 1
+          done
+
           BORE_UI_PORT=$(grep -oE 'bore\.pub:[0-9]+' /tmp/bore-ui.log | head -n 1 | cut -d: -f2)
           BORE_IP=$(dig +short bore.pub | head -n 1)
+          RUNNER_IP=$(curl -s https://ifconfig.me)
           TMATE_SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          TMATE_WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
 
+          echo ""
           echo "=================================================================="
           echo "🚀 FLOCI MULTI-CLOUD LAB + WEB UI READY (${{ inputs.cloud_env }})"
           echo "=================================================================="
-          echo "Public Tunnel IP          : $BORE_IP (bore.pub)"
-          echo "SSH Username              : runner"
-          echo "Fallback SSH Password     : $TEMP_PASS"
-          echo "------------------------------------------------------------------"
-          echo "🌐 1️⃣ ACCESS WEB CONSOLE ON YOUR LOCALHOST (:4500) VIA SSH:"
-          echo "   Run this on your laptop:"
+          echo "🌐 1. DIRECT HTTPS WEB CONSOLE URL (Click to Open in Browser):"
+          echo "   👉 $CF_URL"
+          echo "   (Backup HTTP URL: http://bore.pub:$BORE_UI_PORT)"
+          echo ""
+          echo "🔑 2. SSH CREDENTIALS:"
+          echo "   Runner Public IP      : $RUNNER_IP"
+          echo "   Tunnel IP (bore.pub)  : $BORE_IP"
+          echo "   SSH Username          : runner"
+          echo "   Fallback SSH Password : $TEMP_PASS"
+          echo ""
+          echo "💻 3. SSH WITH LOCALHOST PORT FORWARDING (Run on your PC):"
           echo "   ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub"
-          echo "   Then open: http://localhost:4500"
           echo ""
-          echo "🌐 2️⃣ DIRECT PUBLIC WEB CONSOLE URL (No SSH needed):"
-          echo "   http://bore.pub:$BORE_UI_PORT  (or http://$BORE_IP:$BORE_UI_PORT)"
-          echo ""
-          echo "💻 3️⃣ TMATE SSH FALLBACK:"
-          echo "   $TMATE_SSH"
+          echo "🛠️ 4. TMATE INSTANT SSH & WEB TERMINAL:"
+          echo "   SSH : $TMATE_SSH"
+          echo "   Web : $TMATE_WEB"
           echo "=================================================================="
 
+          # Write a clickable Markdown summary to the GitHub Actions Summary page
+          cat << EOF >> $GITHUB_STEP_SUMMARY
+          ## 🚀 Floci Multi-Cloud Lab Ready (\`${{ inputs.cloud_env }}\`)
+          | Access Method | Link / Command |
+          | :--- | :--- |
+          | **🌐 Direct Web Console (HTTPS)** | [**$CF_URL**]($CF_URL) |
+          | **🌐 Backup Web Console (HTTP)** | \`http://bore.pub:$BORE_UI_PORT\` |
+          | **💻 Web Terminal (Browser SSH)** | [**$TMATE_WEB**]($TMATE_WEB) |
+          | **🔑 SSH Password** | \`$TEMP_PASS\` (User: \`runner\`) |
+          | **⚡ Instant Tmate SSH** | \`$TMATE_SSH\` |
+          | **🔌 Localhost Port-Forward SSH** | \`ssh -p $BORE_SSH_PORT -L 4500:localhost:4500 -L 4566:localhost:4566 -L 4577:localhost:4577 -L 4588:localhost:4588 -L 4599:localhost:4599 runner@bore.pub\` |
+          EOF
+
+      - name: Keep Session Alive for 5 Hours
+        env:
+          SESSION_HOURS: ${{ inputs.session_hours }}
+        run: |
+          echo "Session is now live! Click 'Summary' in the top-left sidebar or scroll up to 'Start SSH & Web Console Tunnels' for your clickable URLs."
+          echo "To stop early, run inside SSH: touch /tmp/stop-session"
           MAX_SECONDS=$(( SESSION_HOURS * 3600 ))
           ELAPSED=0
           while [ $ELAPSED -lt $MAX_SECONDS ]; do
-            [ -f /tmp/stop-session ] && break
+            if [ -f /tmp/stop-session ]; then
+              echo "Stop signal detected. Ending session..."
+              break
+            fi
             sleep 30
             ELAPSED=$(( ELAPSED + 30 ))
           done
